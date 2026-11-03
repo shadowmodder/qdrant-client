@@ -157,7 +157,21 @@ def validate_vector_dimension(got: int, expected: int, vector_name: str) -> None
         )
 
 
-def validate_multivector(vector: Any, vector_name: str) -> None:
+def validate_payload(payload: Any, operation: str) -> None:
+    """Reject a payload that is not a JSON object, as the server does at write time.
+
+    Without this a list payload crashed `set_payload` with a raw AttributeError
+    part-way through the write, and `overwrite_payload` stored the list as the
+    point' payload, corrupting it.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Wrong input: Payload must be a JSON object for '{operation}', "
+            f"got {type(payload).__name__}"
+        )
+
+
+    def validate_multivector(vector: Any, vector_name: str) -> None:
     """Reject empty multivectors, empty sub-vectors and NaN values, as the server does."""
     if len(vector) == 0:
         raise ValueError(f"Wrong input: Multivector must not be empty for vector '{vector_name}'")
@@ -3228,6 +3242,7 @@ class LocalCollection:
         # id it could not find. Deleted points count as missing - writing to one would also
         # persist it, bringing it back the next time the collection is opened.
         ids = self._selector_to_ids(selector)
+        validate_payload(payload, "set_payload")
         base_payload = to_jsonable_python(payload)
 
         keys: list[JsonPathItem] | None = parse_json_path(key) if key is not None else None
@@ -3271,6 +3286,7 @@ class LocalCollection:
         # id it could not find. Deleted points count as missing - writing to one would also
         # persist it, bringing it back the next time the collection is opened.
         ids = self._selector_to_ids(selector)
+        validate_payload(payload, "overwrite_payload")
         missing: types.PointId | None = None
         for point_id in ids:
             idx = self._existing_idx(point_id)
