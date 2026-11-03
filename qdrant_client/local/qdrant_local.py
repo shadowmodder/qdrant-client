@@ -397,6 +397,10 @@ class QdrantLocal(QdrantBase):
                 )
                 for pair in pairs
             ]
+        elif isinstance(query, rest_models.RelevanceFeedbackQuery):
+            query.relevance_feedback.target = input_into_vector(query.relevance_feedback.target)
+            for item in query.relevance_feedback.feedback:
+                item.example = input_into_vector(item.example)
         elif isinstance(query, rest_models.OrderByQuery):
             pass
         elif isinstance(query, rest_models.FusionQuery):
@@ -413,6 +417,7 @@ class QdrantLocal(QdrantBase):
         self,
         prefetch: Sequence[types.Prefetch] | types.Prefetch | None,
         collection_name: str,
+        mentioned_ids: set[types.PointId],
     ) -> list[types.Prefetch]:
         if prefetch is None:
             return []
@@ -429,29 +434,35 @@ class QdrantLocal(QdrantBase):
             prefetches = list(prefetch)
 
         return [
-            self._resolve_prefetch_input(prefetch, collection_name)
+            self._resolve_prefetch_input(prefetch, collection_name, mentioned_ids)
             for prefetch in prefetches
             if prefetch is not None
         ]
 
     def _resolve_prefetch_input(
-        self, prefetch: types.Prefetch, collection_name: str
+        self, prefetch: types.Prefetch, collection_name: str, mentioned_ids: set[types.PointId]
     ) -> types.Prefetch:
+        """
+        Resolves a copy of a prefetch tree and adds the point ids mentioned anywhere in it to
+        `mentioned_ids`. The server excludes these ids from every prefetch, so they belong in the
+        root filter.
+        """
         if prefetch.query is None:
             return prefetch
 
         prefetch = deepcopy(prefetch)
-        query, mentioned_ids = self._resolve_query_input(
+        query, query_mentioned_ids = self._resolve_query_input(
             collection_name,
             prefetch.query,
             prefetch.using,
             prefetch.lookup_from,
         )
         prefetch.query = query
+        mentioned_ids.update(query_mentioned_ids)
 
-        prefetch.filter = ignore_mentioned_ids_filter(prefetch.filter, list(mentioned_ids))
-
-        prefetch.prefetch = self._resolve_prefetches_input(prefetch.prefetch, collection_name)
+        prefetch.prefetch = self._resolve_prefetches_input(
+            prefetch.prefetch, collection_name, mentioned_ids
+        )
 
         return prefetch
 
@@ -489,13 +500,14 @@ class QdrantLocal(QdrantBase):
                 stacklevel=5,
             )
 
+        mentioned_ids: set[types.PointId] = set()
         if query is not None:
             query, mentioned_ids = self._resolve_query_input(
                 collection_name, query, using, lookup_from
             )
-            query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
 
-        prefetch = self._resolve_prefetches_input(prefetch, collection_name)
+        prefetch = self._resolve_prefetches_input(prefetch, collection_name, mentioned_ids)
+        query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
 
         return collection.query_points(
             query=query,
@@ -579,13 +591,14 @@ class QdrantLocal(QdrantBase):
                 stacklevel=5,
             )
 
+        mentioned_ids: set[types.PointId] = set()
         if query is not None:
             query, mentioned_ids = self._resolve_query_input(
                 collection_name, query, using, lookup_from
             )
-            query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
 
-        prefetch = self._resolve_prefetches_input(prefetch, collection_name)
+        prefetch = self._resolve_prefetches_input(prefetch, collection_name, mentioned_ids)
+        query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
 
         with_lookup_collection = None
         if with_lookup is not None:
@@ -988,6 +1001,7 @@ class QdrantLocal(QdrantBase):
         id_tracker: types.IdTrackerParams | None = None,
         **kwargs: Any,
     ) -> bool:
+        """Create a local collection after validating its name and vector configuration."""
         if self.closed:
             raise RuntimeError("QdrantLocal instance is closed. Please create a new instance.")
 
@@ -1003,6 +1017,13 @@ class QdrantLocal(QdrantBase):
         # the server reserves the empty name for the default dense vector
         if sparse_vectors_config is not None and "" in sparse_vectors_config:
             raise ValueError("Sparse vector name cannot be empty")
+        if isinstance(vectors_config, Mapping):
+            for vector_name in vectors_config:
+                if vector_name in (sparse_vectors_config or {}):
+                    raise ValueError(
+                        "Dense and sparse vector names must be unique - "
+                        f"duplicate found with '{vector_name}'"
+                    )
         if collection_name in self.collections:
             raise ValueError(f"Collection {collection_name} already exists")
         # a collection must not take the name of an existing alias either
@@ -1331,7 +1352,7 @@ class QdrantLocal(QdrantBase):
         **kwargs: Any,
     ) -> types.OptimizationsResponse:
         raise NotImplementedError(
-            "Get optimizations is not supported in the local Qdrant. " "Please use server Qdrant."
+            "Get optimizations is not supported in the local Qdrant. Please use server Qdrant."
         )
 
     def list_shard_keys(
