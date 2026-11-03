@@ -149,7 +149,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
                 for collection_name, indexes in meta.get("text_indexes", {}).items():
                     self.collections[collection_name].text_indexes = {
                         field_name: rest_models.TextIndexParams(**params)
-                        for (field_name, params) in indexes.items()
+                        for field_name, params in indexes.items()
                     }
         lock_file_path = os.path.join(self.location, ".lock")
         if not os.path.exists(lock_file_path):
@@ -178,15 +178,15 @@ class AsyncQdrantLocal(AsyncQdrantBase):
             {
                 "collections": {
                     collection_name: to_dict(collection.config)
-                    for (collection_name, collection) in self.collections.items()
+                    for collection_name, collection in self.collections.items()
                 },
                 "aliases": self.aliases if aliases is None else aliases,
                 "text_indexes": {
                     collection_name: {
                         field_name: to_dict(params, exclude_none=True)
-                        for (field_name, params) in collection.text_indexes.items()
+                        for field_name, params in collection.text_indexes.items()
                     }
-                    for (collection_name, collection) in self.collections.items()
+                    for collection_name, collection in self.collections.items()
                     if collection.text_indexes
                 },
             }
@@ -361,6 +361,10 @@ class AsyncQdrantLocal(AsyncQdrantBase):
                 )
                 for pair in pairs
             ]
+        elif isinstance(query, rest_models.RelevanceFeedbackQuery):
+            query.relevance_feedback.target = input_into_vector(query.relevance_feedback.target)
+            for item in query.relevance_feedback.feedback:
+                item.example = input_into_vector(item.example)
         elif isinstance(query, rest_models.OrderByQuery):
             pass
         elif isinstance(query, rest_models.FusionQuery):
@@ -372,7 +376,10 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         return (query, mentioned_ids)
 
     def _resolve_prefetches_input(
-        self, prefetch: Sequence[types.Prefetch] | types.Prefetch | None, collection_name: str
+        self,
+        prefetch: Sequence[types.Prefetch] | types.Prefetch | None,
+        collection_name: str,
+        mentioned_ids: set[types.PointId],
     ) -> list[types.Prefetch]:
         if prefetch is None:
             return []
@@ -384,23 +391,30 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         elif isinstance(prefetch, Sequence):
             prefetches = list(prefetch)
         return [
-            self._resolve_prefetch_input(prefetch, collection_name)
+            self._resolve_prefetch_input(prefetch, collection_name, mentioned_ids)
             for prefetch in prefetches
             if prefetch is not None
         ]
 
     def _resolve_prefetch_input(
-        self, prefetch: types.Prefetch, collection_name: str
+        self, prefetch: types.Prefetch, collection_name: str, mentioned_ids: set[types.PointId]
     ) -> types.Prefetch:
+        """
+        Resolves a copy of a prefetch tree and adds the point ids mentioned anywhere in it to
+        `mentioned_ids`. The server excludes these ids from every prefetch, so they belong in the
+        root filter.
+        """
         if prefetch.query is None:
             return prefetch
         prefetch = deepcopy(prefetch)
-        (query, mentioned_ids) = self._resolve_query_input(
+        query, query_mentioned_ids = self._resolve_query_input(
             collection_name, prefetch.query, prefetch.using, prefetch.lookup_from
         )
         prefetch.query = query
-        prefetch.filter = ignore_mentioned_ids_filter(prefetch.filter, list(mentioned_ids))
-        prefetch.prefetch = self._resolve_prefetches_input(prefetch.prefetch, collection_name)
+        mentioned_ids.update(query_mentioned_ids)
+        prefetch.prefetch = self._resolve_prefetches_input(
+            prefetch.prefetch, collection_name, mentioned_ids
+        )
         return prefetch
 
     async def query_points(
@@ -433,12 +447,13 @@ class AsyncQdrantLocal(AsyncQdrantBase):
                 idx="local_query_points_search_params_ignored",
                 stacklevel=5,
             )
+        mentioned_ids: set[types.PointId] = set()
         if query is not None:
-            (query, mentioned_ids) = self._resolve_query_input(
+            query, mentioned_ids = self._resolve_query_input(
                 collection_name, query, using, lookup_from
             )
-            query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
-        prefetch = self._resolve_prefetches_input(prefetch, collection_name)
+        prefetch = self._resolve_prefetches_input(prefetch, collection_name, mentioned_ids)
+        query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
         return collection.query_points(
             query=query,
             prefetch=prefetch,
@@ -514,12 +529,13 @@ class AsyncQdrantLocal(AsyncQdrantBase):
                 idx="local_query_points_search_params_ignored",
                 stacklevel=5,
             )
+        mentioned_ids: set[types.PointId] = set()
         if query is not None:
-            (query, mentioned_ids) = self._resolve_query_input(
+            query, mentioned_ids = self._resolve_query_input(
                 collection_name, query, using, lookup_from
             )
-            query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
-        prefetch = self._resolve_prefetches_input(prefetch, collection_name)
+        prefetch = self._resolve_prefetches_input(prefetch, collection_name, mentioned_ids)
+        query_filter = ignore_mentioned_ids_filter(query_filter, list(mentioned_ids))
         with_lookup_collection = None
         if with_lookup is not None:
             if isinstance(with_lookup, str):
@@ -737,7 +753,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         return types.CollectionsAliasesResponse(
             aliases=[
                 rest_models.AliasDescription(alias_name=alias_name, collection_name=name)
-                for (alias_name, name) in self.aliases.items()
+                for alias_name, name in self.aliases.items()
                 if name == collection_name
             ]
         )
@@ -748,7 +764,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         return types.CollectionsAliasesResponse(
             aliases=[
                 rest_models.AliasDescription(alias_name=alias_name, collection_name=name)
-                for (alias_name, name) in self.aliases.items()
+                for alias_name, name in self.aliases.items()
             ]
         )
 
@@ -758,7 +774,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         return types.CollectionsResponse(
             collections=[
                 rest_models.CollectionDescription(name=name)
-                for (name, _) in self.collections.items()
+                for name, _ in self.collections.items()
             ]
         )
 
@@ -868,7 +884,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         del _collection
         self.aliases = {
             alias_name: name
-            for (alias_name, name) in self.aliases.items()
+            for alias_name, name in self.aliases.items()
             if name != collection_name
         }
         collection_path = self._collection_path(collection_name)
@@ -887,6 +903,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         id_tracker: types.IdTrackerParams | None = None,
         **kwargs: Any,
     ) -> bool:
+        """Create a local collection after validating its name and vector configuration."""
         if self.closed:
             raise RuntimeError("QdrantLocal instance is closed. Please create a new instance.")
         self._validate_new_collection_name(collection_name)
@@ -900,6 +917,12 @@ class AsyncQdrantLocal(AsyncQdrantBase):
             self._validate_new_vector_name(vector_name, "sparse")
         if sparse_vectors_config is not None and "" in sparse_vectors_config:
             raise ValueError("Sparse vector name cannot be empty")
+        if isinstance(vectors_config, Mapping):
+            for vector_name in vectors_config:
+                if vector_name in (sparse_vectors_config or {}):
+                    raise ValueError(
+                        f"Dense and sparse vector names must be unique - duplicate found with '{vector_name}'"
+                    )
         if collection_name in self.collections:
             raise ValueError(f"Collection {collection_name} already exists")
         if collection_name in self.aliases:
@@ -981,6 +1004,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
         update_mode: types.UpdateMode | None = None,
         **kwargs: Any,
     ) -> None:
+
         def uuid_generator() -> Generator[str, None, None]:
             while True:
                 yield str(uuid4())
@@ -1002,7 +1026,7 @@ class AsyncQdrantLocal(AsyncQdrantBase):
                 vector=(vector.tolist() if isinstance(vector, np.ndarray) else vector) or {},
                 payload=payload or {},
             )
-            for (point_id, vector, payload) in zip(
+            for point_id, vector, payload in zip(
                 uuid_generator() if ids is None else ids,
                 iter(vectors),
                 itertools.cycle([{}]) if payload is None else payload,
