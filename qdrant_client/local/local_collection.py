@@ -59,12 +59,14 @@ from qdrant_client.local.multi_distances import (
     MultiDiscoveryQuery,
     MultiContextQuery,
     MultiContextPair,
+    MultiNaiveFeedbackQuery,
     calculate_multi_distance,
     calculate_multi_recommend_best_scores,
     calculate_multi_discovery_scores,
     calculate_multi_context_scores,
     calculate_multi_recommend_sum_scores,
     calculate_multi_distance_core,
+    calculate_multi_naive_feedback_scores,
 )
 from qdrant_client.local.bm25 import (
     DEFAULT_B,
@@ -103,11 +105,14 @@ from qdrant_client.local.sparse_distances import (
     SparseContextPair,
     SparseContextQuery,
     SparseDiscoveryQuery,
+    SparseFeedbackItem,
+    SparseNaiveFeedbackQuery,
     SparseQueryVector,
     SparseRecoQuery,
     calculate_distance_sparse,
     calculate_sparse_context_scores,
     calculate_sparse_discovery_scores,
+    calculate_sparse_naive_feedback_scores,
     calculate_sparse_recommend_best_scores,
     merge_positive_and_negative_avg,
     sparse_avg,
@@ -116,7 +121,7 @@ from qdrant_client.local.sparse_distances import (
 
 DEFAULT_VECTOR_NAME = ""
 EPSILON = 1.1920929e-7  # https://doc.rust-lang.org/std/f32/constant.EPSILON.html
-# https://github.com/qdrant/qdrant/blob/7164ac4a5987d28f1c93f5712aef8e09e7d93555/lib/segment/src/spaces/simple_avx.rs#L99C10-L99C10
+# https://github.com/qdrant/qdrant/blob/7164ac4a5987d28f1c93f5712aef8e09feedback_items.append(DistFeedbackItem(vector=example_vector, score=item.score))93555/lib/segment/src/spaces/simple_avx.rs#L99C10-L99C10
 
 
 def to_jsonable_python(x: Any) -> Any:
@@ -443,6 +448,9 @@ class LocalCollection:
                         )
                         deleted_ids.append((idx, name))
 
+        # vectors are stored already normalized (see `_to_stored_point`),
+        # normalizing them again would change their last bits
+
                 # handle sparse vectors
                 all_sparse_vector_names = list(self.sparse_vectors.keys())
                 for name in all_sparse_vector_names:
@@ -452,6 +460,9 @@ class LocalCollection:
                     else:
                         sparse_vectors[name].append(empty_sparse_vector())
                         deleted_ids.append((idx, name))
+
+        # vectors are stored already normalized (see `_to_stored_point`),
+        # normalizing them again would change their last bits
 
                 # handle multivectors
                 all_multivector_names = list(self.multivectors.keys())
@@ -465,9 +476,12 @@ class LocalCollection:
                         )
                         deleted_ids.append((idx, name))
 
+        # vectors are stored already normalized (see `_to_stored_point`),
+        # normalizing them again would change their last bits
+
             # setup dense vectors by name
             for name, named_vectors in vectors.items():
-                self.vectors[name] = np.array(named_vectors)
+                self.vectors[name] = np.array(named_vectors, dtype=np.float32)
                 self.deleted_per_vector[name] = np.zeros(len(self.payload), dtype=bool)
 
             # setup sparse vectors by name
@@ -479,7 +493,9 @@ class LocalCollection:
 
             # setup multivectors by name
             for name, named_vectors in multivectors.items():
-                self.multivectors[name] = [np.array(vector) for vector in named_vectors]
+                self.multivectors[name] = [
+            np.array(vector, dtype=np.float32) for vector in named_vectors
+        ]
                 self.deleted_per_vector[name] = np.zeros(len(self.payload), dtype=bool)
 
             # track deleted points by named vector
@@ -644,7 +660,13 @@ class LocalCollection:
                 f"got a str: {with_vectors!r}"
             )
 
-        requested_names = None if with_vectors is True else set(with_vectors)
+        if not isinstance(with_vectors, bool):
+                for name in with_vectors:
+                    if name not in self._all_vectors_keys:
+                        raise ValueError(f"Wrong input: Not existing vector name error: {name}")
+                requested_names = set(with_vectors)
+            else:
+                requested_names = None
 
         def included(name: str) -> bool:
             if requested_names is not None and name not in requested_names:
@@ -766,6 +788,30 @@ class LocalCollection:
 
         vectors = vectors[: len(self.payload)]
 
+        query_vectors: list[types.NumpyArray] = []  # sparse vectors have no fixed size
+        if isinstance(query_vector, np.ndarray):
+            query_vectors = [query_vector]
+        elif isinstance(query_vector, (RecoQuery, MultiRecoQuery)):
+            query_vectors = [*query_vector.positive, *query_vector.negative]
+        elif isinstance(query_vector, (DiscoveryQuery, MultiDiscoveryQuery)):
+            query_vectors = [query_vector.target]
+            for pair in query_vector.context:
+                query_vectors += [pair.positive, pair.negative]
+        elif isinstance(query_vector, (ContextQuery, MultiContextQuery)):
+            for pair in query_vector.context_pairs:
+                query_vectors += [pair.positive, pair.negative]
+        elif isinstance(query_vector, NaiveFeedbackQuery):
+            query_vectors = [item.vector for item in query_vector.feedback] + [query_vector.target]
+
+        # numpy broadcasts a one-element vector instead of failing like the server
+        for vector in query_vectors:
+            expected_dim = self.get_vector_params(name).size
+            if vector.shape[-1] != expected_dim:
+                raise ValueError(
+                    "Wrong input: Vector dimension error: "
+                    f"expected dim: {expected_dim}, got {vector.shape[-1]}"
+                )
+
         if isinstance(query_vector, np.ndarray):
             if len(query_vector.shape) == 1:
                 scores = calculate_distance(query_vector, vectors, distance)
@@ -834,6 +880,14 @@ class LocalCollection:
             scores = calculate_distance_sparse(query_vector, vectors)
         elif isinstance(query_vector, NaiveFeedbackQuery):
             scores = calculate_naive_feedback_query(query_vector, vectors, distance)
+        elif isinstance(query_vector, SparseNaiveFeedbackQuery):
+            if rescore_idf:
+                query_vector = query_vector.transform_sparse(
+                    lambda x: self._rescore_idf(x, name, idf_corpus)
+                )
+            scores = calculate_sparse_naive_feedback_scores(query_vector, vectors)
+        elif isinstance(query_vector, MultiNaiveFeedbackQuery):
+            scores = calculate_multi_naive_feedback_scores(query_vector, vectors, distance)
         else:
             raise (ValueError(f"Unsupported query vector type {type(query_vector)}"))
 
@@ -851,6 +905,7 @@ class LocalCollection:
                 MultiContextQuery,
                 MultiRecoQuery,
                 NaiveFeedbackQuery,
+            MultiNaiveFeedbackQuery,
             ),  # sparse structures are not required, sparse always uses DOT
         ):
             order = np.argsort(scores)[::-1]
@@ -936,7 +991,9 @@ class LocalCollection:
                 idf_corpus=self._idf_corpus_of(search_params),
             )
         else:
-            # It is a base query
+            # Same as the server: a random sample without prefetches ignores offset, since its output is not stable
+            offset = 0 if isinstance(query, models.SampleQuery) else offset
+
             scored_points = self._query_collection(
                 query=query,
                 using=using,
@@ -1205,11 +1262,11 @@ class LocalCollection:
         elif isinstance(query, models.SampleQuery):
             if query.sample == models.Sample.RANDOM:
                 return self._sample_randomly(
-                    limit=limit,
+                    limit=limit + offset,
                     query_filter=query_filter,
                     with_payload=with_payload,
                     with_vectors=with_vectors,
-                )
+                )[offset:]
             else:
                 raise ValueError(f"Unknown Sample variant: {query.sample}")
         elif isinstance(query, models.FusionQuery):
@@ -1597,8 +1654,9 @@ class LocalCollection:
         self._validate_with_payload(with_payload)
 
         result = []
-        ids = [normalize_point_id(id_) for id_ in ids]
-        for point_id in ids:
+        # the server returns each point once, in the order of its first occurrence in `ids`
+        unique_ids = dict.fromkeys(normalize_point_id(id_) for id_ in ids)
+        for point_id in unique_ids:
             if point_id not in self.ids:
                 continue
 
@@ -1707,15 +1765,30 @@ class LocalCollection:
     def _recommend_average_dense(
         positive_vectors: list[list[float]], negative_vectors: list[list[float]]
     ) -> types.NumpyArray:
+        """A dense vector or multivector the way the collection holds it: float32, normalized
+        for cosine distance."""
+        vector_np = np.array(vector, dtype=np.float32)
+        if self.get_vector_params(vector_name).distance == models.Distance.COSINE:
+            if vector_name in self.vectors:
+                norm = np.linalg.norm(vector_np)
+                vector_np = vector_np / norm if norm > EPSILON else vector_np
+            else:
+                vector_norm = np.linalg.norm(vector_np, axis=-1)[:, np.newaxis]
+                vector_np /= np.where(vector_norm != 0.0, vector_norm, EPSILON)
+        return vector_np
         positive_vectors_np = np.stack(positive_vectors)
         negative_vectors_np = np.stack(negative_vectors) if len(negative_vectors) > 0 else None
 
         mean_positive_vector = np.mean(positive_vectors_np, axis=0)
 
         if negative_vectors_np is not None:
-            vector = (
-                mean_positive_vector + mean_positive_vector - np.mean(negative_vectors_np, axis=0)
-            )
+            mean_negative_vector = np.mean(negative_vectors_np, axis=0)
+            if len(mean_positive_vector) != len(mean_negative_vector):
+                    raise ValueError(
+                        "Wrong input: Vector dimension error: "
+                        f"expected dim: {len(mean_positive_vector)}, got {len(mean_negative_vector)}"
+                    )
+                vector = mean_positive_vector + mean_positive_vector - mean_negative_vector
         else:
             vector = mean_positive_vector
         return vector
@@ -2258,6 +2331,11 @@ class LocalCollection:
     ) -> tuple[list[types.Record], types.PointId | None]:
         self._validate_with_payload(with_payload)
 
+        if order_by is not None and offset is not None:
+            raise ValueError(
+                "Offset is not supported in conjunction with `order_by` scroll parameter"
+        )
+
         if len(self.ids) == 0:
             validate_filter(
                 scroll_filter
@@ -2275,11 +2353,6 @@ class LocalCollection:
             )
 
         # order by value
-        if offset is not None:
-            raise ValueError(
-                "Offset is not supported in conjunction with `order_by` scroll parameter"
-            )
-
         return self._scroll_by_value(
             order_by=order_by,
             scroll_filter=scroll_filter,
@@ -2677,14 +2750,21 @@ class LocalCollection:
         if target_id is not None:
             mentioned_ids.append(target_id)
 
+        is_sparse = vector_name in self.sparse_vectors
         feedback_items: list[DistFeedbackItem] = []
+        sparse_feedback_items: list[SparseFeedbackItem] = []
         for item in relevance_feedback.feedback:
             example_vector, example_id = self._preprocess_vector_input(
                 item.example, self, vector_name
             )
             if example_id is not None:
                 mentioned_ids.append(example_id)
-            feedback_items.append(DistFeedbackItem(vector=example_vector, score=item.score))
+            if is_sparse:
+                sparse_feedback_items.append(
+                    SparseFeedbackItem(vector=example_vector, score=item.score)
+                )
+            else:
+                feedback_items.append(DistFeedbackItem(vector=example_vector, score=item.score))
 
         query_filter = ignore_mentioned_ids_filter(query_filter, mentioned_ids)
 
@@ -2800,12 +2880,7 @@ class LocalCollection:
                     self.deleted_per_vector[vector_name], 1
                 )
             else:
-                vector_np = np.array(vector, dtype=np.float32)
-                params = self.get_vector_params(vector_name)
-                if params.distance == models.Distance.COSINE:
-                    norm = np.linalg.norm(vector_np)
-                    vector_np = vector_np / norm if norm > EPSILON else vector_np
-                named_vectors[idx] = vector_np
+                named_vectors[idx] = self._to_stored_vector(vector, vector_name)
                 self.deleted_per_vector[vector_name] = np.append(
                     self.deleted_per_vector[vector_name], 0
                 )
@@ -2856,12 +2931,7 @@ class LocalCollection:
                     self.deleted_per_vector[vector_name], 1
                 )
             else:
-                vector_np = np.array(vector, dtype=np.float32)
-                params = self.get_vector_params(vector_name)
-                if params.distance == models.Distance.COSINE:
-                    vector_norm = np.linalg.norm(vector_np, axis=-1)[:, np.newaxis]
-                    vector_np /= np.where(vector_norm != 0.0, vector_norm, EPSILON)
-                named_vectors[idx] = vector_np
+                named_vectors[idx] = self._to_stored_vector(vector, vector_name)
                 self.deleted_per_vector[vector_name] = np.append(
                     self.deleted_per_vector[vector_name], 0
                 )
@@ -2869,6 +2939,19 @@ class LocalCollection:
             self.multivectors[vector_name] = named_vectors
 
     def _validate_point(self, point: models.PointStruct) -> models.PointStruct:
+        """`point` with its vectors as the collection holds them, like `_persist_by_id` stores."""
+        if isinstance(point.vector, dict):
+            vector: models.VectorStruct = {
+                vector_name: (
+                    vector
+                    if isinstance(vector, SparseVector)
+                    else self._to_stored_vector(vector, vector_name).tolist()
+                )
+                for vector_name, vector in point.vector.items()
+            }
+        else:
+            vector = self._to_stored_vector(point.vector, DEFAULT_VECTOR_NAME).tolist()
+        return construct(models.PointStruct, id=point.id, vector=vector, payload=point.payload)
         """Validate a point and return a normalized copy, without touching collection state.
 
         Every write path runs this over all of its points before applying any of them, so a
@@ -2949,7 +3032,7 @@ class LocalCollection:
 
         # Store the point before applying it, see `_persist_by_id`.
         if self.storage is not None:
-            self.storage.persist(point)
+            self.storage.persist(self._to_stored_point(point))
         apply_point(point)
 
     @staticmethod
@@ -3038,6 +3121,34 @@ class LocalCollection:
 
         return validated
 
+    def _to_stored_vector(self, vector: Any, vector_name: str) -> types.NumpyArray:
+        """A dense vector or multivector the way the collection holds it: float32, normalized
+        for cosine distance."""
+        vector_np = np.array(vector, dtype=np.float32)
+        if self.get_vector_params(vector_name).distance == models.Distance.COSINE:
+            if vector_name in self.vectors:
+                norm = np.linalg.norm(vector_np)
+                vector_np = vector_np / norm if norm > EPSILON else vector_np
+            else:
+                vector_norm = np.linalg.norm(vector_np, axis=-1)[:, np.newaxis]
+                vector_np /= np.where(vector_norm != 0.0, vector_norm, EPSILON)
+        return vector_np
+
+    def _to_stored_point(self, point: models.PointStruct) -> models.PointStruct:
+        """`point` with its vectors as the collection holds them, like `_persist_by_id` stores."""
+        if isinstance(point.vector, dict):
+            vector: models.VectorStruct = {
+                vector_name: (
+                    vector
+                    if isinstance(vector, SparseVector)
+                    else self._to_stored_vector(vector, vector_name).tolist()
+                )
+                for vector_name, vector in point.vector.items()
+            }
+        else:
+            vector = self._to_stored_vector(point.vector, DEFAULT_VECTOR_NAME).tolist()
+        return construct(models.PointStruct, id=point.id, vector=vector, payload=point.payload)
+
     def _apply_named_vectors(self, idx: int, validated: list[tuple[str, Any]]) -> None:
         """Apply already validated named vectors. Call `_validate_named_vectors` first."""
         for vector_name, vector_np in validated:
@@ -3122,7 +3233,7 @@ class LocalCollection:
         # Like `update_vectors`, a point the collection does not hold does not stop the rest
         # of the request: everything else is deleted, and the 404 comes afterwards.
         missing: types.PointId | None = None
-        for point_id in ids:
+        for point_id in unique_ids:
             idx = self._existing_idx(point_id)
             if idx is None:
                 missing = point_id if missing is None else missing
@@ -3137,7 +3248,7 @@ class LocalCollection:
             raise KeyError(missing)
 
     def _delete_ids(self, ids: list[types.PointId]) -> None:
-        for point_id in ids:
+        for point_id in unique_ids:
             if point_id in self.ids:
                 # Remove the stored record before hiding the point: if this fails, the points
                 # not reached yet must stay visible so that a retry can select them again.
@@ -3224,7 +3335,7 @@ class LocalCollection:
                 )
 
             point = models.PointStruct(id=point_id, payload=payload, vector=vector)
-            self.storage.persist(point)
+            self.storage.persist(self._to_stored_point(point))
 
     def set_payload(
         self,
@@ -3248,7 +3359,7 @@ class LocalCollection:
         keys: list[JsonPathItem] | None = parse_json_path(key) if key is not None else None
 
         missing: types.PointId | None = None
-        for point_id in ids:
+        for point_id in unique_ids:
             idx = self._existing_idx(point_id)
             if idx is None:
                 missing = point_id if missing is None else missing
@@ -3288,7 +3399,7 @@ class LocalCollection:
         ids = self._selector_to_ids(selector)
         validate_payload(payload, "overwrite_payload")
         missing: types.PointId | None = None
-        for point_id in ids:
+        for point_id in unique_ids:
             idx = self._existing_idx(point_id)
             if idx is None:
                 missing = point_id if missing is None else missing
@@ -3317,7 +3428,7 @@ class LocalCollection:
         # persist it, bringing it back the next time the collection is opened.
         ids = self._selector_to_ids(selector)
         missing: types.PointId | None = None
-        for point_id in ids:
+        for point_id in unique_ids:
             idx = self._existing_idx(point_id)
             if idx is None:
                 missing = point_id if missing is None else missing
@@ -3347,7 +3458,7 @@ class LocalCollection:
         # persist it, bringing it back the next time the collection is opened.
         ids = self._selector_to_ids(selector)
         missing: types.PointId | None = None
-        for point_id in ids:
+        for point_id in unique_ids:
             idx = self._existing_idx(point_id)
             if idx is None:
                 missing = point_id if missing is None else missing
