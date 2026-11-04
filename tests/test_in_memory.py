@@ -10,38 +10,6 @@ def qdrant() -> QdrantClient:
     return QdrantClient(":memory:")
 
 
-def test_non_dict_payload_is_rejected_on_write(qdrant: QdrantClient):
-    """A payload that is not a JSON object must be rejected, as the server does.
-
-    Regression: `set_payload` crashed with a raw AttributeError, `overwrite_payload`
-    stored the list as the point's payload, and `update_collection` stored it as the
-    collection metadata - corrupting state that only surfaced on the next read.
-    """
-    qdrant.create_collection(
-        collection_name="test_collection",
-        vectors_config=models.VectorParams(size=2, distance=models.Distance.DOT),
-    )
-    qdrant.upsert(
-        collection_name="test_collection",
-        points=[models.PointStruct(id=1, vector=[1.0, 2.0], payload={"a": 1})],
-    )
-
-    with pytest.raises(ValueError, match="Wrong input"):
-        qdrant.set_payload("test_collection", payload=[1, 2, 3], points=[1])
-    with pytest.raises(ValueError, match="Wrong input"):
-        qdrant.set_payload("test_collection", payload=[1, 2, 3], points=[1], key="arr")
-    with pytest.raises(ValueError, match="Wrong input"):
-        qdrant.set_payload("test_collection", payload=None, points=[1])
-    with pytest.raises(ValueError, match="Wrong input"):
-        qdrant.overwrite_payload("test_collection", payload=[1, 2, 3], points=[1])
-    with pytest.raises(ValueError, match="Wrong input"):
-        qdrant.update_collection("test_collection", metadata=[1, 2, 3])
-
-    # the rejected writes left nothing behind: the point and the config still read clean
-    assert qdrant.retrieve("test_collection", ids=[1], with_payload=True)[0].payload == {"a": 1}
-    assert qdrant.get_collection("test_collection").config.metadata is None
-
-
 def test_dense_in_memory_key_filter_returns_results(qdrant: QdrantClient):
     qdrant.create_collection(
         collection_name="test_collection",
@@ -413,3 +381,78 @@ def test_reupserting_identical_cosine_vector_stores_identical_vectors(qdrant: Qd
     updated = qdrant.retrieve("test_collection", [1], with_vectors=True)[0].vector
 
     assert updated == inserted
+
+
+def test_non_dict_payload_is_rejected_on_write(qdrant: QdrantClient):
+    """A payload that is not a JSON object must be rejected, as the server does.
+
+    Regression: `set_payload` crashed with a raw AttributeError, `overwrite_payload`
+    stored the list as the point's payload, and `update_collection` stored it as the
+    collection metadata - corrupting state that only surfaced on the next read.
+    """
+    qdrant.create_collection(
+        collection_name="test_collection",
+        vectors_config=models.VectorParams(size=2, distance=models.Distance.DOT),
+    )
+    qdrant.upsert(
+        collection_name="test_collection",
+        points=[models.PointStruct(id=1, vector=[1.0, 2.0], payload={"a": 1})],
+    )
+
+    with pytest.raises(ValueError, match="Wrong input"):
+        qdrant.set_payload("test_collection", payload=[1, 2, 3], points=[1])
+    with pytest.raises(ValueError, match="Wrong input"):
+        qdrant.set_payload("test_collection", payload=[1, 2, 3], points=[1], key="arr")
+    with pytest.raises(ValueError, match="Wrong input"):
+        qdrant.set_payload("test_collection", payload=None, points=[1])
+    with pytest.raises(ValueError, match="Wrong input"):
+        qdrant.overwrite_payload("test_collection", payload=[1, 2, 3], points=[1])
+    with pytest.raises(ValueError, match="Wrong input"):
+        qdrant.update_collection("test_collection", metadata=[1, 2, 3])
+
+    # the rejected writes left nothing behind: the point and the config still read clean
+    assert qdrant.retrieve("test_collection", ids=[1], with_payload=True)[0].payload == {"a": 1}
+    assert qdrant.get_collection("test_collection").config.metadata is None
+
+
+def test_batch_with_bad_payload_is_rejected_before_any_write(qdrant: QdrantClient):
+    """A batch whose later op carries a non-object payload must be rejected whole.
+
+    Regression (CodeRabbit on #1661): batch [delete, set_payload(list)] applied the
+    delete before the payload guard raised, leaving a partial write. Payloads are
+    now validated up front in `_validate_update_operation`, so nothing applies.
+    """
+    qdrant.create_collection(
+        collection_name="test_collection",
+        vectors_config=models.VectorParams(size=2, distance=models.Distance.DOT),
+    )
+    qdrant.upsert(
+        collection_name="test_collection",
+        points=[
+            models.PointStruct(id=1, vector=[1.0, 2.0], payload={"a": 1}),
+            models.PointStruct(id=2, vector=[3.0, 4.0], payload={"b": 2}),
+        ],
+    )
+
+    # assignment validation is off on the models, so a list sneaks past construction
+    bad_set = models.SetPayload(payload={"c": 3}, points=[2])
+    bad_set.payload = [1, 2, 3]
+    bad_overwrite = models.SetPayload(payload={"d": 4}, points=[2])
+    bad_overwrite.payload = [1, 2, 3]
+
+    for bad_op in (
+        models.SetPayloadOperation(set_payload=bad_set),
+        models.OverwritePayloadOperation(overwrite_payload=bad_overwrite),
+    ):
+        with pytest.raises(ValueError, match="Wrong input"):
+            qdrant.batch_update_points(
+                "test_collection",
+                update_operations=[
+                    models.DeleteOperation(delete=models.PointIdsList(points=[1])),
+                    bad_op,
+                ],
+            )
+
+    # neither the delete nor the payload op applied: both points intact
+    assert qdrant.retrieve("test_collection", ids=[1], with_payload=True)[0].payload == {"a": 1}
+    assert qdrant.retrieve("test_collection", ids=[2], with_payload=True)[0].payload == {"b": 2}
